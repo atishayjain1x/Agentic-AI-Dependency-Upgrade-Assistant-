@@ -1,0 +1,13 @@
+target/
+.idea/
+.vscode/
+*.iml
+.mvn/wrapper/maven-wrapper.jar
+uploads/
+*.log
+__pycache__/
+*.py[cod]
+python-worker/.venv/
+python-worker/.env
+python-worker/data/
+data/

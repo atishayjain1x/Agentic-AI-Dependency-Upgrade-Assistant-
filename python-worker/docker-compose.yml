@@ -1,0 +1,40 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: dependency-agent-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OSV_SCANNER_VERSION: v1.9.2
+    container_name: dependency-agent-worker
+    ports:
+      - "${WORKER_PORT:-8123}:8123"
+    env_file:
+      - .env
+    environment:
+      WORKER_HOST: ${WORKER_HOST:-0.0.0.0}
+      WORKER_PORT: "8123"
+      DATA_DIR: ${DATA_DIR:-/app/data}
+      COMMAND_TIMEOUT_SECONDS: ${COMMAND_TIMEOUT_SECONDS:-600}
+      MAX_ZIP_BYTES: ${MAX_ZIP_BYTES:-209715200}
+      MAX_UNZIPPED_BYTES: ${MAX_UNZIPPED_BYTES:-524288000}
+      MAX_ZIP_ENTRIES: ${MAX_ZIP_ENTRIES:-20000}
+    volumes:
+      - worker_data:/app/data
+      - ./rag-docs:/app/rag-docs:ro
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  worker_data:
