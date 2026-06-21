@@ -1,13 +1,8 @@
 # Agentic AI Dependency Upgrade Assistant
 
-Backend system for analyzing Java/Maven dependency risk, creating an AI-assisted fix plan, and applying approved dependency version updates.
+Python worker for analyzing Java/Maven dependency risk, creating an AI-assisted fix plan, and applying approved dependency version updates.
 
-The project has two main parts:
-
-- Java Spring Boot API: stores upload/fix job metadata and exposes application-facing endpoints.
-- Python FastAPI worker: extracts projects, analyzes dependencies, creates fix plans, applies changes, and returns patch artifacts.
-
-This README focuses on the three worker APIs that drive the dependency upgrade flow:
+The FastAPI worker extracts projects, analyzes dependencies, creates fix plans, applies changes, and returns patch artifacts. These three APIs drive the dependency upgrade flow:
 
 1. `POST /worker/analyze`
 2. `POST /worker/fixPlan`
@@ -459,18 +454,6 @@ docker exec -it dependency-agent-worker cat /app/data/workspaces/applyFixjob1/fi
 ```
 
 ## Run Locally
-
-Java API:
-
-```powershell
-docker compose up -d postgres
-$env:DB_URL="jdbc:postgresql://localhost:5432/dependency_agent"
-$env:DB_USERNAME="postgres"
-$env:DB_PASSWORD="postgres"
-.\mvnw.cmd spring-boot:run
-```
-
-Python worker:
 
 ```powershell
 cd python-worker
