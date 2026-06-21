@@ -1,20 +1,466 @@
-# Dependency Upgrade Agent Backend
+# Agentic AI Dependency Upgrade Assistant
 
-Spring Boot 3 backend for a personal Java dependency upgrade agent. It accepts `repo.zip` uploads, stores them on local disk, persists job metadata in PostgreSQL, and exposes analysis, fix, and report APIs. The Python LangGraph worker is represented by a mocked `WorkerClient` interface for now.
+Backend system for analyzing Java/Maven dependency risk, creating an AI-assisted fix plan, and applying approved dependency version updates.
 
-## Stack
+The project has two main parts:
 
-- Java 21
-- Spring Boot 3
-- Maven
-- Spring Web
-- Spring Data JPA
-- PostgreSQL
-- Bean Validation
+- Java Spring Boot API: stores upload/fix job metadata and exposes application-facing endpoints.
+- Python FastAPI worker: extracts projects, analyzes dependencies, creates fix plans, applies changes, and returns patch artifacts.
 
-## Run
+This README focuses on the three worker APIs that drive the dependency upgrade flow:
 
-Create a PostgreSQL database and set connection variables:
+1. `POST /worker/analyze`
+2. `POST /worker/fixPlan`
+3. `POST /worker/applyFix`
+
+## Worker Flow
+
+```text
+Project ZIP
+   |
+   v
+/worker/analyze
+   - extracts project
+   - detects Maven root
+   - generates SBOM
+   - detects upgrade candidates
+   - scans vulnerabilities
+   - builds dependency report
+   - stores report by jobId
+   |
+   v
+/worker/fixPlan
+   - reads stored analysis report
+   - selects dependencies by IDS, CATEGORY, or ALL
+   - retrieves migration/RAG context
+   - creates planned dependency changes
+   - stores fix plan by fixPlanId
+   |
+   v
+/worker/applyFix
+   - reads stored fix plan
+   - requires approved=true
+   - prepares isolated fix workspace
+   - applies planned pom.xml updates
+   - writes patch artifact
+   - returns compact fix result
+```
+
+The original uploaded project is not edited directly. Fixes are applied in a copied workspace and returned as a patch file.
+
+## Persistence
+
+The Python worker keeps analysis reports and fix plans in memory while running, and also persists them under:
+
+```text
+data/state/analysis-store.json
+data/state/fix-plan-store.json
+```
+
+On worker restart, these files are loaded back into memory.
+
+That means after a restart you can call `/worker/applyFix` with an existing `fixPlanId` without rerunning `/worker/analyze` and `/worker/fixPlan`, as long as the `data` directory is preserved.
+
+Generated artifacts are written under:
+
+```text
+data/artifacts/<fixJobId>/upgrade.patch
+data/workspaces/<fixJobId>/fix-source/
+```
+
+Inside Docker these paths appear as:
+
+```text
+/app/data/artifacts/<fixJobId>/upgrade.patch
+/app/data/workspaces/<fixJobId>/fix-source/
+```
+
+## API 1: Analyze
+
+Creates a dependency report from a project ZIP that already exists on disk.
+
+```http
+POST /worker/analyze
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "jobId": "job3",
+  "projectName": "sample-maven-app",
+  "zipPath": "/app/data/uploads/job3/project.zip"
+}
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "jobId": "job3",
+  "status": "COMPLETED",
+  "message": "Analysis completed",
+  "report": {
+    "jobId": "job3",
+    "projectName": "sample-maven-app",
+    "dependencies": []
+  },
+  "fixReport": null,
+  "fixPlan": null,
+  "errors": []
+}
+```
+
+What it does:
+
+- Validates the ZIP path.
+- Extracts the ZIP into `data/workspaces/<jobId>/source`.
+- Detects the Maven reactor root.
+- Generates dependency evidence.
+- Builds a report.
+- Stores the report using `jobId`.
+
+Command:
+
+```bash
+curl -X POST http://localhost:8123/worker/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": "job3",
+    "projectName": "sample-maven-app",
+    "zipPath": "/app/data/uploads/job3/project.zip"
+  }'
+```
+
+PowerShell:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8123/worker/analyze" `
+  -ContentType "application/json" `
+  -Body '{
+    "jobId": "job3",
+    "projectName": "sample-maven-app",
+    "zipPath": "/app/data/uploads/job3/project.zip"
+  }'
+```
+
+## API 2: Fix Plan
+
+Creates a fix plan from a previously stored analysis report.
+
+```http
+POST /worker/fixPlan
+Content-Type: application/json
+```
+
+Request by dependency IDs:
+
+```json
+{
+  "jobId": "fixPlanjob1",
+  "analysisJobId": "job3",
+  "fixBy": "IDS",
+  "dependencyIds": [
+    "org.apache.logging.log4j:log4j-core"
+  ],
+  "category": null
+}
+```
+
+Request by category:
+
+```json
+{
+  "jobId": "fixPlanjob2",
+  "analysisJobId": "job3",
+  "fixBy": "CATEGORY",
+  "dependencyIds": [],
+  "category": "SECURITY"
+}
+```
+
+Request for all vulnerable dependencies:
+
+```json
+{
+  "jobId": "fixPlanjob3",
+  "analysisJobId": "job3",
+  "fixBy": "ALL",
+  "dependencyIds": [],
+  "category": null
+}
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "jobId": "fixPlanjob1",
+  "status": "COMPLETED",
+  "message": "FIX PLAN CREATED",
+  "report": null,
+  "fixReport": null,
+  "fixPlan": {
+    "fixPlanId": "fixPlanjob1",
+    "analysisJobId": "job3",
+    "fixBy": "IDS",
+    "value": "org.apache.logging.log4j:log4j-core",
+    "status": "PLANNED",
+    "dependencyIds": [
+      "org.apache.logging.log4j:log4j-core"
+    ],
+    "plannedChanges": [
+      {
+        "file": "pom.xml",
+        "dependency": "org.apache.logging.log4j:log4j-core",
+        "fromVersion": "2.14.1",
+        "toVersion": "2.25.4",
+        "changeType": "DEPENDENCY_VERSION_UPDATE"
+      }
+    ],
+    "requiresApproval": true
+  },
+  "errors": []
+}
+```
+
+What it does:
+
+- Loads the analysis report using `analysisJobId`.
+- Selects target dependencies by `fixBy`.
+- Creates normalized `plannedChanges`.
+- Requires approval before applying.
+- Stores the plan using `fixPlanId`.
+
+Supported `fixBy` values:
+
+- `IDS`: fix only dependencies listed in `dependencyIds`.
+- `CATEGORY`: fix dependencies matching `category`.
+- `ALL`: fix all vulnerable dependencies in the report.
+
+Command:
+
+```bash
+curl -X POST http://localhost:8123/worker/fixPlan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": "fixPlanjob1",
+    "analysisJobId": "job3",
+    "fixBy": "IDS",
+    "dependencyIds": [
+      "org.apache.logging.log4j:log4j-core"
+    ],
+    "category": null
+  }'
+```
+
+PowerShell:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8123/worker/fixPlan" `
+  -ContentType "application/json" `
+  -Body '{
+    "jobId": "fixPlanjob1",
+    "analysisJobId": "job3",
+    "fixBy": "IDS",
+    "dependencyIds": [
+      "org.apache.logging.log4j:log4j-core"
+    ],
+    "category": null
+  }'
+```
+
+## API 3: Apply Fix
+
+Applies a stored fix plan. The request body stays small and only approves an existing plan.
+
+```http
+POST /worker/applyFix
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "jobId": "applyFixjob1",
+  "fixPlanId": "fixPlanjob1",
+  "approved": true
+}
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "jobId": "applyFixjob1",
+  "status": "COMPLETED",
+  "message": "FIX APPLIED",
+  "report": null,
+  "fixReport": {
+    "jobId": "applyFixjob1",
+    "analysisJobId": "job3",
+    "status": "COMPLETED",
+    "message": "Applied 1 planned changes; 0 failed to update",
+    "fixedDependencies": [
+      {
+        "file": "pom.xml",
+        "dependency": "org.apache.logging.log4j:log4j-core",
+        "fromVersion": "2.14.1",
+        "toVersion": "2.25.4",
+        "changeType": "DEPENDENCY_VERSION_UPDATE"
+      }
+    ],
+    "failedDependencies": [],
+    "patchPath": "/app/data/artifacts/applyFixjob1/upgrade.patch",
+    "errors": []
+  },
+  "fixPlan": null,
+  "errors": []
+}
+```
+
+What it does:
+
+- Loads the stored fix plan using `fixPlanId`.
+- Verifies `approved=true`.
+- Re-extracts the original analysis ZIP.
+- Creates an original snapshot.
+- Copies the project into a fix workspace.
+- Updates matching `pom.xml` dependency versions.
+- Generates `upgrade.patch`.
+- Returns only the compact fix outcome.
+
+To view the patch inside Docker:
+
+```bash
+docker exec -it dependency-agent-worker cat /app/data/artifacts/applyFixjob1/upgrade.patch
+```
+
+To inspect the fixed `pom.xml` inside Docker:
+
+```bash
+docker exec -it dependency-agent-worker cat /app/data/workspaces/applyFixjob1/fix-source/pom.xml
+```
+
+Command:
+
+```bash
+curl -X POST http://localhost:8123/worker/applyFix \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": "applyFixjob1",
+    "fixPlanId": "fixPlanjob1",
+    "approved": true
+  }'
+```
+
+PowerShell:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8123/worker/applyFix" `
+  -ContentType "application/json" `
+  -Body '{
+    "jobId": "applyFixjob1",
+    "fixPlanId": "fixPlanjob1",
+    "approved": true
+  }'
+```
+
+## Approval Behavior
+
+If `approved` is false, the worker does not apply changes.
+
+```json
+{
+  "jobId": "applyFixjob1",
+  "fixPlanId": "fixPlanjob1",
+  "approved": false
+}
+```
+
+The plan remains available, but the apply step is blocked by approval guardrails.
+
+## Health
+
+```http
+GET /health
+```
+
+Returns service status, RAG index status, and AI provider configuration.
+
+Command:
+
+```bash
+curl http://localhost:8123/health
+```
+
+PowerShell:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8123/health"
+```
+
+## Useful Docker Commands
+
+Start the Python worker stack from the worker folder:
+
+```bash
+cd python-worker
+docker compose up --build
+```
+
+Run in the background:
+
+```bash
+cd python-worker
+docker compose up -d --build
+```
+
+View worker logs:
+
+```bash
+docker logs -f dependency-agent-worker
+```
+
+Open a shell inside the worker:
+
+```bash
+docker exec -it dependency-agent-worker sh
+```
+
+View persisted worker stores:
+
+```bash
+docker exec -it dependency-agent-worker cat /app/data/state/analysis-store.json
+docker exec -it dependency-agent-worker cat /app/data/state/fix-plan-store.json
+```
+
+View generated patch:
+
+```bash
+docker exec -it dependency-agent-worker cat /app/data/artifacts/applyFixjob1/upgrade.patch
+```
+
+View fixed project file:
+
+```bash
+docker exec -it dependency-agent-worker cat /app/data/workspaces/applyFixjob1/fix-source/pom.xml
+```
+
+## Run Locally
+
+Java API:
 
 ```powershell
 docker compose up -d postgres
@@ -24,242 +470,22 @@ $env:DB_PASSWORD="postgres"
 .\mvnw.cmd spring-boot:run
 ```
 
-Uploaded archives are stored under `./uploads` by default. Override with:
+Python worker:
 
 ```powershell
-$env:APP_STORAGE_ROOT="C:\path\to\uploads"
+cd python-worker
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8123
 ```
 
-## API
+## Important Files
 
-- `POST /api/jobs` multipart upload with field `file`, optional `name`. Stores the zip and starts analysis. Returns `jobId`.
-- `GET /api/jobs` returns the status of all analysis jobs.
-- `GET /api/jobs/{jobId}` returns the status of one analysis job.
-- `GET /api/jobs/{jobId}/report` returns the analysis report for one job.
-- `POST /api/jobs/{jobId}/fix` starts a fix job for an analysis job.
-
-Fix request body:
-
-```json
-{
-  "priority": "critical",
-  "dependencyId": "org.springframework.boot:spring-boot-starter-web",
-  "category": "version_bump"
-}
+```text
+python-worker/app/main.py              FastAPI endpoints and persisted worker stores
+python-worker/app/graph.py             Analyze, fix-plan, and apply-fix graph nodes
+python-worker/app/models.py            Request/response schemas
+python-worker/app/tools/file_tools.py  ZIP extraction and workspace preparation
+python-worker/app/tools/fix_tools.py   POM version edits and patch generation
 ```
-
-Supported priorities: `critical`, `high`, `medium`, `low`.
-
-Supported categories: `version_bump`, `parentUpgrade`.
-
-## Dependency Analyzer Agent Roadmap
-
-The target product flow is:
-
-1. Upload repository zip.
-2. Generate full dependency report.
-3. View report details.
-4. Start fix by category, dependency ID, and priority.
-5. Run tests.
-6. Rebuild report and return the updated result.
-
-### Step 1: API Contract
-
-Status: done for the first minimal version.
-
-Java service endpoints:
-
-- `POST /api/jobs`
-- `GET /api/jobs`
-- `GET /api/jobs/{jobId}`
-- `GET /api/jobs/{jobId}/report`
-- `POST /api/jobs/{jobId}/fix`
-
-Upload response:
-
-```json
-{
-  "jobId": "0d4d43ef-dac7-4b30-98d2-7006ef0d8bb6",
-  "status": "ANALYSIS_COMPLETED",
-  "createdAt": "2026-06-08T00:00:00Z"
-}
-```
-
-Job status response:
-
-```json
-{
-  "jobId": "0d4d43ef-dac7-4b30-98d2-7006ef0d8bb6",
-  "status": "ANALYSIS_COMPLETED",
-  "repositoryName": "my-service",
-  "createdAt": "2026-06-08T00:00:00Z",
-  "startedAt": "2026-06-08T00:00:01Z",
-  "completedAt": "2026-06-08T00:00:10Z",
-  "errorMessage": null
-}
-```
-
-Fix request:
-
-```json
-{
-  "priority": "critical",
-  "dependencyId": "org.springframework.boot:spring-boot-starter-web",
-  "category": "version_bump"
-}
-```
-
-Fix response includes the fix plan, patch summary, test output, and rebuilt report JSON.
-
-### Step 2: Job State Machine
-
-Status: done for the first minimal version.
-
-Supported states:
-
-- `UPLOADED`
-- `ANALYSIS_RUNNING`
-- `ANALYSIS_COMPLETED`
-- `ANALYSIS_FAILED`
-- `FIX_RUNNING`
-- `FIX_COMPLETED`
-- `FIX_FAILED`
-- `TEST_RUNNING`
-- `TEST_COMPLETED`
-- `TEST_FAILED`
-- `REPORT_REBUILDING`
-- `COMPLETED`
-- `FAILED`
-
-The current mock flow is synchronous. The future production flow should move worker calls to async dispatch and update these states from worker callbacks or polling.
-
-### Step 3: Python Worker Service
-
-Status: skeleton created in `python-worker`.
-
-Current worker endpoints:
-
-- `GET /health`
-- `POST /analyze`
-- `POST /fix`
-
-Planned worker responsibilities:
-
-1. Extract uploaded zip into an isolated temporary workspace.
-2. Detect Maven or Gradle.
-3. Build dependency inventory.
-4. Use Qdrant-backed RAG over migration guides and documentation.
-5. Generate the dependency report.
-6. Apply focused fixes.
-7. Run tests/build.
-8. Rebuild and return the updated report.
-
-### Step 4: Report Model
-
-Status: done for the first minimal version.
-
-Report fields:
-
-```json
-{
-  "jobId": "0d4d43ef-dac7-4b30-98d2-7006ef0d8bb6",
-  "repositoryName": "my-service",
-  "buildTool": "maven",
-  "generatedAt": "2026-06-08T00:00:00Z",
-  "findings": [
-    {
-      "dependencyId": "org.springframework.boot:spring-boot-starter-web",
-      "groupId": "org.springframework.boot",
-      "artifactId": "spring-boot-starter-web",
-      "currentVersion": "3.2.0",
-      "recommendedVersion": "3.3.6",
-      "latestVersion": "3.3.6",
-      "scope": "compile",
-      "usageLocation": "pom.xml",
-      "priority": "medium",
-      "category": "version_bump",
-      "reason": "Upgrade recommended based on migration docs and compatibility checks.",
-      "migrationGuideRefs": [
-        {
-          "title": "Spring Boot 3.3 Migration Guide",
-          "source": "spring.io",
-          "url": "https://github.com/spring-projects/spring-boot/wiki",
-          "relevanceScore": 0.92
-        }
-      ],
-      "fixAvailable": true
-    }
-  ],
-  "summary": {
-    "totalDependencies": 20,
-    "upgradeCandidates": 5,
-    "criticalCount": 1,
-    "highCount": 2,
-    "mediumCount": 2,
-    "lowCount": 0
-  }
-}
-```
-
-The Java service currently persists report JSON as text. A future migration can move this to PostgreSQL `jsonb` once querying report internals becomes necessary.
-
-## Next Engineering Steps
-
-1. Replace the Java `MockWorkerClient` with an HTTP worker client for `python-worker`.
-2. Make job execution asynchronous.
-3. Add zip extraction and Maven project detection in Python.
-4. Add Qdrant ingestion for migration guides and official docs.
-5. Implement LangGraph nodes for inventory, RAG retrieval, risk scoring, report generation, fix planning, test execution, and report rebuild.
-6. Implement Zip Extraction And Project Detection
-   Worker should:
-   unzip repo
-   detect Maven/Gradle
-   find pom.xml, parent POMs, modules
-   parse dependency tree
-   identify Java/Spring Boot version
-   identify plugins
-   identify test commands
-   For Maven, start with:
-
-mvn dependency:tree
-mvn versions:display-dependency-updates
-mvn versions:display-plugin-updates
-Add Qdrant RAG
-Store migration guides/docs as chunks with metadata:
-source
-framework
-artifact
-fromVersion
-toVersion
-category
-url
-chunkText
-Good first docs:
-
-Spring Boot migration guides
-Spring Framework migration guides
-Hibernate ORM migration guides
-JUnit migration notes
-Maven plugin docs
-popular library changelogs
-Build LangGraph Flow
-A sensible graph:
-ExtractRepo
-DetectBuildTool
-GenerateDependencyInventory
-FindUpgradeCandidates
-RetrieveMigrationDocs
-AssessRiskAndPriority
-GenerateReport
-WaitForFixRequest
-PlanFix
-ApplyFix
-RunTests
-RebuildReport
-ReturnResult
-Make Fixes Narrow
-For the first version, support only:
-direct dependency version bump
-parent POM upgrade
-simple plugin version bump
-Do not try broad code migrations yet.
